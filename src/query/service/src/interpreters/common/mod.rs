@@ -22,6 +22,7 @@ mod stream;
 mod table;
 mod task;
 mod util;
+mod worker;
 
 mod log;
 pub mod table_option_validation;
@@ -39,5 +40,6 @@ pub use task::get_task_client_config;
 pub use task::make_schedule_options;
 pub use task::make_warehouse_options;
 pub use util::check_deduplicate_label;
+pub use worker::get_worker_client_config;
 
 pub use self::metrics::*;
