@@ -117,6 +117,7 @@ impl FuseTable {
             vec![],
             self.get_id(),
             0,
+            0,
             None,
             VirtualSchemaMode::Merge,
             HashMap::new(),
