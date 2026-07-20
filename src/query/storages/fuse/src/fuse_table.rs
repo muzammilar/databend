@@ -97,7 +97,7 @@ use databend_storages_common_table_meta::meta::Versioned;
 use databend_storages_common_table_meta::meta::decode_column_hll;
 use databend_storages_common_table_meta::meta::parse_storage_prefix;
 use databend_storages_common_table_meta::table::ChangeType;
-use databend_storages_common_table_meta::table::ClusterType;
+use databend_storages_common_table_meta::table::HILBERT_CLUSTER_TYPE;
 use databend_storages_common_table_meta::table::OPT_KEY_ANALYZE_FREQUENCY_COLUMNS;
 use databend_storages_common_table_meta::table::OPT_KEY_APPROX_DISTINCT_COLUMNS;
 use databend_storages_common_table_meta::table::OPT_KEY_BLOOM_INDEX_COLUMNS;
@@ -195,6 +195,7 @@ impl FuseTable {
         storage_class_specs: Option<S3StorageClass>,
         disable_refresh: bool,
     ) -> Result<Box<FuseTable>> {
+        Self::normalize_deprecated_cluster_type(&mut table_info);
         let storage_prefix = Self::parse_storage_prefix_from_table_info(&table_info)?;
         let (mut operator, table_type) = match table_info.db_type.clone() {
             DatabaseType::NormalDB => {
@@ -317,6 +318,20 @@ impl FuseTable {
         }))
     }
 
+    fn normalize_deprecated_cluster_type(table_info: &mut TableInfo) {
+        let Some(cluster_type) = table_info.meta.options.remove(OPT_KEY_CLUSTER_TYPE) else {
+            return;
+        };
+
+        if matches!(
+            cluster_type.to_ascii_lowercase().as_str(),
+            HILBERT_CLUSTER_TYPE
+        ) {
+            table_info.meta.cluster_key = None;
+            table_info.meta.cluster_key_v2 = None;
+        }
+    }
+
     pub fn from_table_meta(
         id: u64,
         seq: u64,
@@ -382,21 +397,14 @@ impl FuseTable {
         }
     }
 
-    fn append_top_n_column_fields_from_options(
+    fn append_top_n_column_fields(
         table_schema: TableSchemaRef,
-        top_n_size: Option<usize>,
-        frequency_columns: Option<&str>,
-    ) -> Result<BTreeMap<FieldIndex, TableField>> {
-        let Some(_) = top_n_size else {
-            return Ok(BTreeMap::new());
-        };
-        let Some(columns) = frequency_columns else {
-            return Ok(BTreeMap::new());
-        };
+        columns: ApproxDistinctColumns,
+    ) -> BTreeMap<FieldIndex, TableField> {
         let source_schema = table_schema.remove_virtual_computed_fields();
         let mut fields_map = BTreeMap::new();
 
-        match columns.parse::<ApproxDistinctColumns>()? {
+        match columns {
             ApproxDistinctColumns::All => {
                 for (i, field) in source_schema.fields.into_iter().enumerate() {
                     if RangeIndex::supported_table_type(field.data_type()) {
@@ -418,26 +426,26 @@ impl FuseTable {
             ApproxDistinctColumns::None => {}
         }
 
-        Ok(fields_map)
+        fields_map
     }
 
     pub(crate) fn append_top_n_columns(
         &self,
         source_schema: TableSchemaRef,
     ) -> Result<Option<(BTreeMap<FieldIndex, TableField>, usize)>> {
-        let top_n_size = analyze_top_n_size_from_options(self.table_info.options())?;
-        let frequency_columns = self
+        let Some(top_n_size) = analyze_top_n_size_from_options(self.table_info.options())? else {
+            return Ok(None);
+        };
+        let Some(columns) = self
             .table_info
             .options()
             .get(OPT_KEY_ANALYZE_FREQUENCY_COLUMNS)
-            .map(String::as_str);
-        let top_n_columns_map = Self::append_top_n_column_fields_from_options(
-            source_schema,
-            top_n_size,
-            frequency_columns,
-        )?;
-        Ok(top_n_size
-            .and_then(|size| (!top_n_columns_map.is_empty()).then_some((top_n_columns_map, size))))
+        else {
+            return Ok(None);
+        };
+        let columns = columns.parse::<ApproxDistinctColumns>()?;
+        let top_n_columns_map = Self::append_top_n_column_fields(source_schema, columns);
+        Ok((!top_n_columns_map.is_empty()).then_some((top_n_columns_map, top_n_size)))
     }
 
     pub fn enable_virtual_column(&self) -> bool {
@@ -586,15 +594,11 @@ impl FuseTable {
     }
 
     pub fn linear_cluster_keys(&self, ctx: Arc<dyn TableContext>) -> Vec<RemoteExpr<String>> {
-        if self
-            .cluster_type()
-            .is_none_or(|v| matches!(v, ClusterType::Hilbert))
-        {
+        let Some(cluster_key_exprs) = self.resolve_cluster_keys() else {
             return vec![];
-        }
+        };
 
         let table_meta = Arc::new(self.clone());
-        let cluster_key_exprs = self.resolve_cluster_keys().unwrap();
         let exprs = parse_cluster_keys(ctx, table_meta.clone(), cluster_key_exprs).unwrap();
         let cluster_keys = exprs
             .iter()
@@ -632,18 +636,11 @@ impl FuseTable {
         let Some(ast_exprs) = self.resolve_cluster_keys() else {
             return vec![];
         };
-        let cluster_type = self.get_option(OPT_KEY_CLUSTER_TYPE, ClusterType::Linear);
-        match cluster_type {
-            ClusterType::Hilbert => vec![DataType::Binary],
-            ClusterType::Linear => {
-                let cluster_keys =
-                    parse_cluster_keys(ctx, Arc::new(self.clone()), ast_exprs).unwrap();
-                cluster_keys
-                    .into_iter()
-                    .map(|v| v.data_type().clone())
-                    .collect()
-            }
-        }
+        let cluster_keys = parse_cluster_keys(ctx, Arc::new(self.clone()), ast_exprs).unwrap();
+        cluster_keys
+            .into_iter()
+            .map(|v| v.data_type().clone())
+            .collect()
     }
 
     /// Returns the data retention policy for this table.
@@ -940,9 +937,7 @@ impl FuseTable {
     pub fn enable_stream_block_write(&self, ctx: Arc<dyn TableContext>) -> Result<bool> {
         Ok(ctx.get_settings().get_enable_block_stream_write()?
             && matches!(self.storage_format, FuseStorageFormat::Parquet)
-            && self
-                .cluster_type()
-                .is_none_or(|v| matches!(v, ClusterType::Hilbert)))
+            && self.cluster_key_meta().is_none())
     }
 
     pub fn with_schema(&self, schema: Arc<TableSchema>) -> Arc<FuseTable> {
@@ -1601,7 +1596,11 @@ mod tests {
     use databend_common_meta_app::schema::TableInfo;
     use databend_common_meta_app::schema::TableMeta;
     use databend_common_meta_app::storage::StorageParams;
+    use databend_storages_common_table_meta::table::HILBERT_CLUSTER_TYPE;
+    use databend_storages_common_table_meta::table::LINEAR_CLUSTER_TYPE;
+    use databend_storages_common_table_meta::table::OPT_KEY_CLUSTER_TYPE;
 
+    use super::ApproxDistinctColumns;
     use super::FuseTable;
     use super::allow_credential_chain_for_s3;
     use super::is_system_history_table;
@@ -1621,6 +1620,40 @@ mod tests {
             db_type: DatabaseType::NormalDB,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_normalize_deprecated_hilbert_cluster_type() {
+        let mut table_info = table_info_with_db("default");
+        table_info.meta.cluster_key = Some("(a)".to_string());
+        table_info.meta.cluster_key_v2 = Some((2, "(b)".to_string()));
+        table_info.meta.options.insert(
+            OPT_KEY_CLUSTER_TYPE.to_string(),
+            HILBERT_CLUSTER_TYPE.to_string(),
+        );
+
+        FuseTable::normalize_deprecated_cluster_type(&mut table_info);
+
+        assert_eq!(table_info.meta.cluster_key, None);
+        assert_eq!(table_info.meta.cluster_key_v2, None);
+        assert!(!table_info.meta.options.contains_key(OPT_KEY_CLUSTER_TYPE));
+    }
+
+    #[test]
+    fn test_normalize_deprecated_linear_cluster_type() {
+        let mut table_info = table_info_with_db("default");
+        table_info.meta.cluster_key = Some("(a)".to_string());
+        table_info.meta.cluster_key_v2 = Some((2, "(b)".to_string()));
+        table_info.meta.options.insert(
+            OPT_KEY_CLUSTER_TYPE.to_string(),
+            LINEAR_CLUSTER_TYPE.to_string(),
+        );
+
+        FuseTable::normalize_deprecated_cluster_type(&mut table_info);
+
+        assert_eq!(table_info.meta.cluster_key.as_deref(), Some("(a)"));
+        assert_eq!(table_info.meta.cluster_key_v2, Some((2, "(b)".to_string())));
+        assert!(!table_info.meta.options.contains_key(OPT_KEY_CLUSTER_TYPE));
     }
 
     #[test]
@@ -1660,12 +1693,14 @@ mod tests {
             TableField::new("nested", TableDataType::Variant),
         ]));
 
-        let fields = FuseTable::append_top_n_column_fields_from_options(
+        let fields = FuseTable::append_top_n_column_fields(
             schema,
-            Some(3),
-            Some("a, dropped, nested"),
-        )
-        .unwrap();
+            ApproxDistinctColumns::Specify(vec![
+                "a".to_string(),
+                "dropped".to_string(),
+                "nested".to_string(),
+            ]),
+        );
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields.values().next().unwrap().name(), "a");

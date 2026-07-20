@@ -328,7 +328,6 @@ async fn try_rebuild_req(
             merged_summary,
             merged_segments,
             latest_table.cluster_key_meta(),
-            latest_table.cluster_type(),
             None,
             table_meta_timestamps,
         )?;

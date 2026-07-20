@@ -18,7 +18,6 @@ databend-common-catalog = { workspace = true }
 databend-common-config = { workspace = true }
 databend-common-exception = { workspace = true }
 databend-common-expression = { workspace = true }
-databend-common-io = { workspace = true }
 databend-common-license = { workspace = true }
 databend-common-management = { workspace = true }
 databend-common-meta-api = { workspace = true }
@@ -33,7 +32,6 @@ databend-common-version = { workspace = true }
 databend-enterprise-attach-table = { workspace = true }
 databend-enterprise-data-mask-feature = { workspace = true }
 databend-enterprise-fail-safe = { workspace = true }
-databend-enterprise-hilbert-clustering = { workspace = true }
 databend-enterprise-resources-management = { workspace = true }
 databend-enterprise-row-access-policy-feature = { workspace = true }
 databend-enterprise-storage-encryption = { workspace = true }
