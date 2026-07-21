@@ -913,7 +913,7 @@ fn fill_missing_segment_cluster_stats(
         None,
         Some(cluster_key_id),
     );
-    summary.cluster_stats = Some(ClusterStatistics::new(cluster_key_id, min, max, 0, None));
+    summary.cluster_stats = Some(ClusterStatistics::new(cluster_key_id, min, max, 0));
 }
 
 fn generate_segment_stats(hlls: Vec<Option<RawBlockHLL>>) -> Result<Option<Vec<u8>>> {
